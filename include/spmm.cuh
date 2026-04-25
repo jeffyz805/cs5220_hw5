@@ -5,236 +5,167 @@
 
 namespace spmm {
 
-__device__ __forceinline__ int find_row(const uint32_t * __restrict__ rowptrs,
-                                        int m, uint32_t target)
-{
-    int lo = 0, hi = m;
-    while (lo < hi) {
-        int mid = lo + (hi - lo + 1) / 2;
-        if (__ldg(&rowptrs[mid]) <= target) lo = mid;
-        else hi = mid - 1;
-    }
-    return lo;
-}
-
 template <int TILE>
-__global__ void SpMM_merge(const int m, const int k,
-                           const float * __restrict__ d_A_vals,
-                           const uint32_t * __restrict__ d_A_colinds,
-                           const uint32_t * __restrict__ d_A_rowptrs,
-                           const float * __restrict__ d_X,
-                           float * __restrict__ d_Y,
-                           const int total_nnz, const int num_warps)
+__global__ void SpMM(const size_t m, const size_t k,
+                     float *d_A_vals, uint32_t *d_A_colinds, uint32_t *d_A_rowptrs,
+                     float *d_X, float *d_Y)
 {
-    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-    if (warp_id >= num_warps) return;
-    const int lane = threadIdx.x & 31;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    if (warp_id >= m) return;
+    int lane = threadIdx.x % 32;
 
-    const int nz_start = (int)((long long)warp_id * total_nnz / num_warps);
-    const int nz_end   = (int)((long long)(warp_id + 1) * total_nnz / num_warps);
-    if (nz_start >= nz_end) return;
+    int row = warp_id;
+    int nz_begin = d_A_rowptrs[row];
+    int nz_end = d_A_rowptrs[row + 1];
 
-    int row           = find_row(d_A_rowptrs, m, (uint32_t)nz_start);
-    const int last_row = find_row(d_A_rowptrs, m, (uint32_t)(nz_end - 1));
+    float acc[TILE] = {0};
 
-    while (row <= last_row) {
-        const int rp_start  = (int)__ldg(&d_A_rowptrs[row]);
-        const int rp_end    = (int)__ldg(&d_A_rowptrs[row + 1]);
-        const int my_nz_beg = max(rp_start, nz_start);
-        const int my_nz_end = min(rp_end, nz_end);
+    for (int chunk_base = nz_begin; chunk_base < nz_end; chunk_base += 32) {
+        int my_nz = chunk_base + lane;
+        float A_val = (my_nz < nz_end) ? d_A_vals[my_nz] : 0.0f;
+        int col_ind = (my_nz < nz_end) ? (int)d_A_colinds[my_nz] : 0;
 
-        if (my_nz_beg >= my_nz_end) { row++; continue; }
+        int valid_count = min(32, (int)(nz_end - chunk_base));
 
+        for (int i = 0; i < valid_count; i++) {
+            float b_A_val = __shfl_sync(0xffffffff, A_val, i);
+            int b_col_ind = __shfl_sync(0xffffffff, col_ind, i);
 
-        float acc[TILE];
-        #pragma unroll
-        for (int t = 0; t < TILE; t++) acc[t] = 0.0f;
-        for (int chunk = my_nz_beg; chunk < my_nz_end; chunk += 32) {
-            const int nz_idx = chunk + lane;
-            const bool valid = (nz_idx < my_nz_end);
-            float A_val = valid ? __ldg(&d_A_vals[nz_idx]) : 0.0f;
-            int   col   = valid ? (int)__ldg(&d_A_colinds[nz_idx]) : 0;
+            // base pointer into row b_col_ind of X
+            float *x_row = d_X + b_col_ind * k;
 
-            const int valid_count = min(32, my_nz_end - chunk);
-
-            for (int i = 0; i < valid_count; i++) {
-                const float bA = __shfl_sync(0xffffffff, A_val, i);
-                const int   bC = __shfl_sync(0xffffffff, col, i);
-
-                const float *xr = d_X + (size_t)bC * k;
-
-                #pragma unroll
-                for (int t = 0; t < TILE; t++) {
-                    const int c = t * 32 + lane;
-                    if (c < k) {
-                        acc[t] += bA * __ldg(&xr[c]);
-                    }
+            #pragma unroll
+            for (int t = 0; t < TILE; t++) {
+                int x_col = t * 32 + lane;
+                if (x_col < k) {
+                    acc[t] += b_A_val * x_row[x_col];
                 }
             }
         }
+    }
 
-        const bool fully_owned = (rp_start >= nz_start) && (rp_end <= nz_end);
-        float *yr = d_Y + (size_t)row * k;
+    // write results — no atomics needed, one warp owns the row
+    float *y_row = d_Y + row * k;
 
-        #pragma unroll
-        for (int t = 0; t < TILE; t++) {
-            const int c = t * 32 + lane;
-            if (c < k) {
-                if (fully_owned) yr[c] = acc[t];
-                else atomicAdd(&yr[c], acc[t]);
-            }
+    #pragma unroll
+    for (int t = 0; t < TILE; t++) {
+        int x_col = t * 32 + lane;
+        if (x_col < k) {
+            y_row[x_col] = acc[t];
         }
-
-        row++;
     }
 }
 
+// float4 variant: each thread handles 4 columns per tile slot
+// requires k to be divisible by 128 (32 threads * 4 floats)
 template <int TILE4>
-__global__ void SpMM_merge_vec4(const int m, const int k,
-                                const float * __restrict__ d_A_vals,
-                                const uint32_t * __restrict__ d_A_colinds,
-                                const uint32_t * __restrict__ d_A_rowptrs,
-                                const float * __restrict__ d_X,
-                                float * __restrict__ d_Y,
-                                const int total_nnz, const int num_warps)
+__global__ void SpMM_vec4(const size_t m, const size_t k,
+                          float *d_A_vals, uint32_t *d_A_colinds, uint32_t *d_A_rowptrs,
+                          float *d_X, float *d_Y)
 {
-    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-    if (warp_id >= num_warps) return;
-    const int lane = threadIdx.x & 31;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    if (warp_id >= m) return;
+    int lane = threadIdx.x % 32;
 
-    const int nz_start = (int)((long long)warp_id * total_nnz / num_warps);
-    const int nz_end   = (int)((long long)(warp_id + 1) * total_nnz / num_warps);
-    if (nz_start >= nz_end) return;
+    int row = warp_id;
+    int nz_begin = d_A_rowptrs[row];
+    int nz_end = d_A_rowptrs[row + 1];
 
-    int row            = find_row(d_A_rowptrs, m, (uint32_t)nz_start);
-    const int last_row = find_row(d_A_rowptrs, m, (uint32_t)(nz_end - 1));
+    // TILE4 = number of float4 loads per thread
+    // total columns covered = TILE4 * 32 * 4 = TILE4 * 128
+    float4 acc4[TILE4];
+    #pragma unroll
+    for (int t = 0; t < TILE4; t++) {
+        acc4[t] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
 
-    const int k4 = k >> 2;
-    const float4 *X4 = reinterpret_cast<const float4 *>(d_X);
-    float4       *Y4 = reinterpret_cast<float4 *>(d_Y);
+    // cast X and Y to float4 for vectorized access
+    // k_vec = number of float4s per row = k / 4
+    int k_vec = k / 4;
+    float4 *X4 = reinterpret_cast<float4 *>(d_X);
+    float4 *Y4 = reinterpret_cast<float4 *>(d_Y);
 
-    while (row <= last_row) {
-        const int rp_start  = (int)__ldg(&d_A_rowptrs[row]);
-        const int rp_end    = (int)__ldg(&d_A_rowptrs[row + 1]);
-        const int my_nz_beg = max(rp_start, nz_start);
-        const int my_nz_end = min(rp_end, nz_end);
+    for (int chunk_base = nz_begin; chunk_base < nz_end; chunk_base += 32) {
+        int my_nz = chunk_base + lane;
+        float A_val = (my_nz < nz_end) ? d_A_vals[my_nz] : 0.0f;
+        int col_ind = (my_nz < nz_end) ? (int)d_A_colinds[my_nz] : 0;
 
-        if (my_nz_beg >= my_nz_end) { row++; continue; }
+        int valid_count = min(32, (int)(nz_end - chunk_base));
 
-        float4 acc[TILE4];
-        #pragma unroll
-        for (int t = 0; t < TILE4; t++)
-            acc[t] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int i = 0; i < valid_count; i++) {
+            float b_A_val = __shfl_sync(0xffffffff, A_val, i);
+            int b_col_ind = __shfl_sync(0xffffffff, col_ind, i);
 
-        for (int chunk = my_nz_beg; chunk < my_nz_end; chunk += 32) {
-            const int nz_idx = chunk + lane;
-            const bool valid = (nz_idx < my_nz_end);
-            float A_val = valid ? __ldg(&d_A_vals[nz_idx]) : 0.0f;
-            int   col   = valid ? (int)__ldg(&d_A_colinds[nz_idx]) : 0;
+            float4 *x_row4 = X4 + b_col_ind * k_vec;
 
-            const int valid_count = min(32, my_nz_end - chunk);
-
-            for (int i = 0; i < valid_count; i++) {
-                const float bA = __shfl_sync(0xffffffff, A_val, i);
-                const int   bC = __shfl_sync(0xffffffff, col, i);
-
-                const float4 *xr = X4 + (size_t)bC * k4;
-
-                #pragma unroll
-                for (int t = 0; t < TILE4; t++) {
-                    const int idx = t * 32 + lane;
-                    if (idx < k4) {
-                        float4 xv = __ldg(&xr[idx]);
-                        acc[t].x += bA * xv.x;
-                        acc[t].y += bA * xv.y;
-                        acc[t].z += bA * xv.z;
-                        acc[t].w += bA * xv.w;
-                    }
+            #pragma unroll
+            for (int t = 0; t < TILE4; t++) {
+                int idx = t * 32 + lane;
+                if (idx < k_vec) {
+                    float4 xv = x_row4[idx];
+                    acc4[t].x += b_A_val * xv.x;
+                    acc4[t].y += b_A_val * xv.y;
+                    acc4[t].z += b_A_val * xv.z;
+                    acc4[t].w += b_A_val * xv.w;
                 }
             }
         }
+    }
 
-        const bool fully_owned = (rp_start >= nz_start) && (rp_end <= nz_end);
+    float4 *y_row4 = Y4 + row * k_vec;
 
-        if (fully_owned) {
-            float4 *yr = Y4 + (size_t)row * k4;
-            #pragma unroll
-            for (int t = 0; t < TILE4; t++) {
-                const int idx = t * 32 + lane;
-                if (idx < k4) yr[idx] = acc[t];
-            }
-        } else {
-            float *yr = d_Y + (size_t)row * k;
-            #pragma unroll
-            for (int t = 0; t < TILE4; t++) {
-                const int base = (t * 32 + lane) << 2;
-                if (base + 3 < k) {
-                    atomicAdd(&yr[base],     acc[t].x);
-                    atomicAdd(&yr[base + 1], acc[t].y);
-                    atomicAdd(&yr[base + 2], acc[t].z);
-                    atomicAdd(&yr[base + 3], acc[t].w);
-                }
-            }
+    #pragma unroll
+    for (int t = 0; t < TILE4; t++) {
+        int idx = t * 32 + lane;
+        if (idx < k_vec) {
+            y_row4[idx] = acc4[t];
         }
-
-        row++;
     }
 }
 
-void SpMM_wrapper(csr_t& A, float * d_X, float * d_Y, const size_t k)
+void SpMM_wrapper(csr_t& A, float *d_X, float *d_Y, const size_t k)
 {
-    const int m = (int)A.get_rows();
+    size_t m = A.get_rows();
 
-    uint32_t total_nnz_h;
-    cudaMemcpy(&total_nnz_h, A.get_rowptrs() + m,
-               sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    const int total_nnz = (int)total_nnz_h;
+    int threads_per_block = 256;
+    int blocks = ((int)m * 32 + threads_per_block - 1) / threads_per_block;
 
-    cudaMemset(d_Y, 0, (size_t)m * k * sizeof(float));
-
-    const int nnz_per_warp = 256;
-    int num_warps = max(1, (total_nnz + nnz_per_warp - 1) / nnz_per_warp);
-
-    const int tpb = 256;
-    const int blocks = (num_warps * 32 + tpb - 1) / tpb;
-
-    if (k % 128 == 0 && k >= 128) {
-        const int tile4 = (int)k / 128;
+    // use float4 kernel when k is divisible by 128 (32 lanes * 4 floats)
+    // otherwise fall back to scalar kernel
+    if (k % 128 == 0) {
+        int tile4 = k / 128;
         switch (tile4) {
-            case 1:
-                SpMM_merge_vec4<1><<<blocks, tpb>>>(m, (int)k,
-                    A.get_vals(), A.get_colinds(), A.get_rowptrs(),
-                    d_X, d_Y, total_nnz, num_warps);
+            case 1:  // k=128
+                SpMM_vec4<1><<<blocks, threads_per_block>>>(m, k,
+                    A.get_vals(), A.get_colinds(), A.get_rowptrs(), d_X, d_Y);
                 break;
-            case 2:
-                SpMM_merge_vec4<2><<<blocks, tpb>>>(m, (int)k,
-                    A.get_vals(), A.get_colinds(), A.get_rowptrs(),
-                    d_X, d_Y, total_nnz, num_warps);
+            case 2:  // k=256
+                SpMM_vec4<2><<<blocks, threads_per_block>>>(m, k,
+                    A.get_vals(), A.get_colinds(), A.get_rowptrs(), d_X, d_Y);
                 break;
             default:
-                SpMM_merge_vec4<2><<<blocks, tpb>>>(m, (int)k,
-                    A.get_vals(), A.get_colinds(), A.get_rowptrs(),
-                    d_X, d_Y, total_nnz, num_warps);
+                SpMM_vec4<2><<<blocks, threads_per_block>>>(m, k,
+                    A.get_vals(), A.get_colinds(), A.get_rowptrs(), d_X, d_Y);
                 break;
         }
     } else {
-        // Scalar path
-        const int tile = ((int)k + 31) / 32;
+        int tile = (k + 31) / 32;
         switch (tile) {
-            case 1:
-                SpMM_merge<1><<<blocks, tpb>>>(m, (int)k,
-                    A.get_vals(), A.get_colinds(), A.get_rowptrs(),
-                    d_X, d_Y, total_nnz, num_warps);
+            case 1:  // k <= 32
+                SpMM<1><<<blocks, threads_per_block>>>(m, k,
+                    A.get_vals(), A.get_colinds(), A.get_rowptrs(), d_X, d_Y);
                 break;
-            case 2:
-                SpMM_merge<2><<<blocks, tpb>>>(m, (int)k,
-                    A.get_vals(), A.get_colinds(), A.get_rowptrs(),
-                    d_X, d_Y, total_nnz, num_warps);
+            case 2:  // k=64
+                SpMM<2><<<blocks, threads_per_block>>>(m, k,
+                    A.get_vals(), A.get_colinds(), A.get_rowptrs(), d_X, d_Y);
+                break;
+            case 8:  // k=256
+                SpMM<8><<<blocks, threads_per_block>>>(m, k,
+                    A.get_vals(), A.get_colinds(), A.get_rowptrs(), d_X, d_Y);
                 break;
             default:
-                SpMM_merge<8><<<blocks, tpb>>>(m, (int)k,
-                    A.get_vals(), A.get_colinds(), A.get_rowptrs(),
-                    d_X, d_Y, total_nnz, num_warps);
+                SpMM<8><<<blocks, threads_per_block>>>(m, k,
+                    A.get_vals(), A.get_colinds(), A.get_rowptrs(), d_X, d_Y);
                 break;
         }
     }
